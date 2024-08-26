@@ -86,11 +86,11 @@ def select_face(det_bboxes, probs):
     sorted_bboxes = sorted(filtered_bboxes, key=lambda x:(x[3]-x[1]) * (x[2] - x[0]), reverse=True)
     return sorted_bboxes[0]
 
-
-
 def main():
     args = parse_args()
+    run_inference(args)
 
+def run_inference(args):
     config = OmegaConf.load(args.config)
     if config.weight_dtype == "fp16":
         weight_dtype = torch.float16
@@ -103,7 +103,6 @@ def main():
 
     inference_config_path = config.inference_config
     infer_config = OmegaConf.load(inference_config_path)
-
 
     ############# model_init started #############
 
@@ -250,8 +249,10 @@ def main():
             audio_clip = AudioFileClip(audio_path)
             video_clip = video_clip.set_audio(audio_clip)
             video_clip.write_videofile(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4", codec="libx264", audio_codec="aac")
-            print(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4")
+            output_path = f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4"
+            print('output_path', output_path)
 
+    return output_path
 
 if __name__ == "__main__":
     main()
