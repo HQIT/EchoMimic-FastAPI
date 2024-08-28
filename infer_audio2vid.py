@@ -88,18 +88,22 @@ def select_face(det_bboxes, probs):
 
 def main():
     args = parse_args()
-    run_inference(args)
+    ctx = {}
+    run_inference_init(args, ctx)
+    run_inference(args, ctx)
 
-def run_inference(args):
+def run_inference_init(args, ctx):
     config = OmegaConf.load(args.config)
     if config.weight_dtype == "fp16":
         weight_dtype = torch.float16
     else:
         weight_dtype = torch.float32
+    ctx['weight_dtype'] = weight_dtype
 
     device = args.device
     if device.__contains__("cuda") and not torch.cuda.is_available():
         device = "cpu"
+    ctx['device'] = device
 
     inference_config_path = config.inference_config
     infer_config = OmegaConf.load(inference_config_path)
@@ -109,7 +113,8 @@ def run_inference(args):
     ## vae init
     vae = AutoencoderKL.from_pretrained(
         config.pretrained_vae_path,
-    ).to("cuda", dtype=weight_dtype)
+    ).to(device, dtype=weight_dtype)
+    ctx['vae'] = vae
 
     ## reference net init
     reference_unet = UNet2DConditionModel.from_pretrained(
@@ -119,6 +124,7 @@ def run_inference(args):
     reference_unet.load_state_dict(
         torch.load(config.reference_unet_path, map_location="cpu"),
     )
+    ctx['reference_unet'] = reference_unet
 
     ## denoising net init
     if os.path.exists(config.motion_module_path):
@@ -145,34 +151,42 @@ def run_inference(args):
         torch.load(config.denoising_unet_path, map_location="cpu"),
         strict=False
     )
+    ctx['denoising_unet'] = denoising_unet
 
     ## face locator init
     face_locator = FaceLocator(320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)).to(
         dtype=weight_dtype, device="cuda"
     )
     face_locator.load_state_dict(torch.load(config.face_locator_path))
+    ctx['face_locator'] = face_locator
 
     ### load audio processor params
     audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
+    ctx['audio_processor'] = audio_processor
 
     ### load face detector params
     face_detector = MTCNN(image_size=320, margin=0, min_face_size=20, thresholds=[0.6, 0.7, 0.7], factor=0.709, post_process=True, device=device)
+    ctx['face_detector'] = face_detector
 
     ############# model_init finished #############
 
-    width, height = args.W, args.H
     sched_kwargs = OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
     scheduler = DDIMScheduler(**sched_kwargs)
+    ctx['scheduler'] = scheduler
 
+def run_inference(args, ctx):
+    config = OmegaConf.load(args.config)
+    width, height = args.W, args.H
+    
     pipe = Audio2VideoPipeline(
-        vae=vae,
-        reference_unet=reference_unet,
-        denoising_unet=denoising_unet,
-        audio_guider=audio_processor,
-        face_locator=face_locator,
-        scheduler=scheduler,
+        vae=ctx['vae'],
+        reference_unet=ctx['reference_unet'],
+        denoising_unet=ctx['denoising_unet'],
+        audio_guider=ctx['audio_processor'],
+        face_locator=ctx['face_locator'],
+        scheduler=ctx['scheduler'],
     )
-    pipe = pipe.to("cuda", dtype=weight_dtype)
+    pipe = pipe.to(ctx['device'], dtype=ctx['weight_dtype'])
 
     date_str = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M")
@@ -196,6 +210,7 @@ def run_inference(args):
             face_img = cv2.imread(ref_image_path)
             face_mask = np.zeros((face_img.shape[0], face_img.shape[1])).astype('uint8')
 
+            face_detector = ctx['face_detector']
             det_bboxes, probs = face_detector.detect(face_img)
             select_bbox = select_face(det_bboxes, probs)
             if select_bbox is None:
@@ -219,7 +234,9 @@ def run_inference(args):
                 face_mask = cv2.resize(face_mask, (args.W, args.H))
 
             ref_image_pil = Image.fromarray(face_img[:, :, [2, 1, 0]])
-            face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device="cuda").unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
+            weight_dtype = ctx['weight_dtype']
+            device = ctx['device']
+            face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
 
             video = pipe(
                 ref_image_pil,

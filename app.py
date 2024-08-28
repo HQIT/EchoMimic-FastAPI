@@ -1,8 +1,12 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from infer_audio2vid import run_inference
+from infer_audio2vid import run_inference, run_inference_init
+from urllib.parse import urlparse
 
-import argparse, os, yaml, tempfile, requests
+import argparse, os, yaml, tempfile, requests, logging
+
+logging.basicConfig(level=logging.DEBUG)
+_logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -26,6 +30,14 @@ class InferenceRequest(BaseModel):
     ref_image_url: str
     audio_url: str
 
+class QuotedString(str):
+    pass
+
+def quoted_presenter(dumper, data):
+    return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='"')
+
+yaml.add_representer(QuotedString, quoted_presenter)
+
 def _create_temp_config_file(ref_image_path, audio_path):
     config_content = {
         "pretrained_base_model_path": "./pretrained_weights/sd-image-variations-diffusers/",
@@ -37,8 +49,10 @@ def _create_temp_config_file(ref_image_path, audio_path):
         "motion_module_path": "./pretrained_weights/motion_module.pth",
         "inference_config": "./configs/inference/inference_v2.yaml",
         "weight_dtype": "fp16",
-        "avatar": {
-            ref_image_path: audio_path
+        "test_cases": {
+            QuotedString(ref_image_path): [
+                QuotedString(audio_path)
+            ]
         }
     }
 
@@ -47,10 +61,16 @@ def _create_temp_config_file(ref_image_path, audio_path):
     return temp_file.name
 
 def _download_file(url):
-    response = requests.get(url)
-    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-        temp_file.write(response.content)
-    return temp_file.name
+    parsed_url = urlparse(url)
+    if parsed_url.scheme == 'file':
+        return parsed_url.path
+    else:
+        response = requests.get(url)
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(response.content)
+        return temp_file.name
+
+_ctx = {}
 
 @app.post("/a2v")
 async def infer(request: InferenceRequest):
@@ -58,6 +78,10 @@ async def infer(request: InferenceRequest):
     audio_path = _download_file(request.audio_url)
     config_path = _create_temp_config_file(ref_image_path, audio_path)
     
+    _logger.debug(f"ref_image_path: {ref_image_path}")
+    _logger.debug(f"audio_path: {audio_path}")
+    _logger.debug(f"config_path: {config_path}")
+
     args = argparse.Namespace(
         config=config_path,
         W=request.config.W,
@@ -74,16 +98,18 @@ async def infer(request: InferenceRequest):
         fps=request.config.fps,
         device=request.config.device
     )
+    _logger.debug(f"args: {args}")
 
-    output_path = run_inference(args)
+    output_path = run_inference(args, _ctx)
     
-    return {"output_path": output_path}
+    return {
+        "ref_image_path": ref_image_path, 
+        "audio_path": audio_path, 
+        "output_path": output_path
+    }
 
-if __name__ == "__main__":
-    import uvicorn
-    parser = argparse.ArgumentParser(description="Run FastAPI server.")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the server on")
-    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on")
-    args = parser.parse_args()
-
-    uvicorn.run(app, host=args.host, port=args.port)
+@app.on_event("startup")
+def _init():
+    _config_path = _create_temp_config_file("", "")
+    args = argparse.Namespace(config=_config_path, device="cuda")
+    run_inference_init(args, _ctx)
