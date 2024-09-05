@@ -63,9 +63,15 @@ def _create_temp_config_file(ref_image_path, audio_path):
 def _download_file(url):
     parsed_url = urlparse(url)
     if parsed_url.scheme == 'file':
+        if not os.path.exists(parsed_url.path):
+            return None
         return parsed_url.path
     else:
-        response = requests.get(url)
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+        except requests.RequestException:
+            return None
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             temp_file.write(response.content)
         return temp_file.name
@@ -81,6 +87,13 @@ async def infer(request: InferenceRequest):
     _logger.debug(f"ref_image_path: {ref_image_path}")
     _logger.debug(f"audio_path: {audio_path}")
     _logger.debug(f"config_path: {config_path}")
+
+    if not ref_image_path or not audio_path:
+        return {
+            "ref_image_path": ref_image_path, 
+            "audio_path": audio_path, 
+            "output_path": None
+        }
 
     args = argparse.Namespace(
         config=config_path,
