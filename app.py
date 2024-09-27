@@ -5,8 +5,8 @@ from urllib.parse import urlparse
 
 import argparse, os, yaml, tempfile, requests, logging
 
-logging.basicConfig(level=logging.DEBUG)
 _logger = logging.getLogger(__name__)
+_logger.setLevel(logging.DEBUG)
 
 app = FastAPI()
 

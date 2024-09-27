@@ -1,2 +1,4 @@
 pretrained_weights
 .gitignore
+output
+__pycache__

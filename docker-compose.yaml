@@ -1,0 +1,20 @@
+networks:
+  geminar-network:
+    ipam:
+      config:
+        - subnet: 192.168.168.0/24
+
+services:
+  echo-mimic-webgui:
+    image: 59.78.189.137:8080/hqit/geminar-echo-mimic:latest
+    runtime: nvidia
+    command: python3 -u webgui.py --server_port 8000
+    ports:
+      - "28008:8000"
+    volumes:
+      - ./pretrained_weights:/app/pretrained_weights
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=3,4
+    networks:
+      - geminar-network
+    restart: unless-stopped

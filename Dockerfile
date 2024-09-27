@@ -21,4 +21,8 @@ RUN pip install -r requirements.fastapi.txt
 
 ENV FFMPEG_PATH=/app/ffmpeg-4.4-amd64-static
 
-CMD ["sh", "-c", "uvicorn app:app --host ${SERVER_HOST} --port ${SERVER_PORT}"]
+COPY . .
+
+ENV LOG_LEVEL=debug
+
+CMD ["sh", "-c", "uvicorn app:app --host ${SERVER_HOST} --port ${SERVER_PORT} --log-level ${LOG_LEVEL}"]

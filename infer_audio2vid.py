@@ -31,21 +31,26 @@ from src.models.face_locator import FaceLocator
 from moviepy.editor import VideoFileClip, AudioFileClip
 from facenet_pytorch import MTCNN
 
+import logging
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.DEBUG)
+
 ffmpeg_path = os.getenv('FFMPEG_PATH')
 if ffmpeg_path is None and platform.system() in ['Linux', 'Darwin']:
     try:
         result = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True)
         if result.returncode == 0:
             ffmpeg_path = result.stdout.strip()
-            print(f"FFmpeg is installed at: {ffmpeg_path}")
+            _logger.debug(f"FFmpeg is installed at: {ffmpeg_path}")
         else:
-            print("FFmpeg is not installed. Please download ffmpeg-static and export to FFMPEG_PATH.")
-            print("For example: export FFMPEG_PATH=/musetalk/ffmpeg-4.4-amd64-static")
+            _logger.error("FFmpeg is not installed. Please download ffmpeg-static and export to FFMPEG_PATH.")
+            _logger.error("For example: export FFMPEG_PATH=/musetalk/ffmpeg-4.4-amd64-static")
     except Exception as e:
         pass
 
 if ffmpeg_path is not None and ffmpeg_path not in os.getenv('PATH'):
-    print("Adding FFMPEG_PATH to PATH")
+    _logger.debug("Adding FFMPEG_PATH to PATH")
     os.environ["PATH"] = f"{ffmpeg_path}:{os.environ['PATH']}"
 
 def parse_args():
@@ -187,6 +192,7 @@ def run_inference(args, ctx):
         scheduler=ctx['scheduler'],
     )
     pipe = pipe.to(ctx['device'], dtype=ctx['weight_dtype'])
+    _logger.debug(f"pipe: {pipe}")
 
     date_str = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M")
@@ -202,17 +208,32 @@ def run_inference(args, ctx):
             else:
                 generator = torch.manual_seed(random.randint(100, 1000000))
 
+            _logger.debug(f"ref_image_path: {ref_image_path}")
+            _logger.debug(f"audio_path: {audio_path}")
+
             ref_name = Path(ref_image_path).stem
             audio_name = Path(audio_path).stem
             final_fps = args.fps
+
+            _logger.debug(f"ref_name: {ref_name}")
+            _logger.debug(f"audio_name: {audio_name}")
+            _logger.debug(f"final_fps: {final_fps}")
 
             #### face musk prepare
             face_img = cv2.imread(ref_image_path)
             face_mask = np.zeros((face_img.shape[0], face_img.shape[1])).astype('uint8')
 
+            _logger.debug(f"face_img: {face_img}")
+            _logger.debug(f"face_mask: {face_mask}")
+
             face_detector = ctx['face_detector']
             det_bboxes, probs = face_detector.detect(face_img)
             select_bbox = select_face(det_bboxes, probs)
+
+            _logger.debug(f"det_bboxes: {det_bboxes}")
+            _logger.debug(f"probs: {probs}")
+            _logger.debug(f"select_bbox: {select_bbox}")
+
             if select_bbox is None:
                 face_mask[:, :] = 255
             else:
@@ -223,11 +244,20 @@ def run_inference(args, ctx):
                 c_pad = int((ce - cb) * args.facemusk_dilation_ratio)
                 face_mask[rb - r_pad : re + r_pad, cb - c_pad : ce + c_pad] = 255
 
+                _logger.debug(f"rb: {rb}")
+                _logger.debug(f"re: {re}")
+                _logger.debug(f"cb: {cb}")
+                _logger.debug(f"ce: {ce}")
+                _logger.debug(f"r_pad: {r_pad}")
+                _logger.debug(f"c_pad: {c_pad}")
+                _logger.debug(f"face_mask: {face_mask}")
+
                 #### face crop
                 r_pad_crop = int((re - rb) * args.facecrop_dilation_ratio)
                 c_pad_crop = int((ce - cb) * args.facecrop_dilation_ratio)
                 crop_rect = [max(0, cb - c_pad_crop), max(0, rb - r_pad_crop), min(ce + c_pad_crop, face_img.shape[1]), min(re + c_pad_crop, face_img.shape[0])]
-                print(crop_rect)
+                _logger.debug(f"crop_rect: {crop_rect}")
+
                 face_img, _ = crop_and_pad(face_img, crop_rect)
                 face_mask, _ = crop_and_pad(face_mask, crop_rect)
                 face_img = cv2.resize(face_img, (args.W, args.H))
@@ -237,6 +267,8 @@ def run_inference(args, ctx):
             weight_dtype = ctx['weight_dtype']
             device = ctx['device']
             face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
+
+            _logger.debug(f"face_mask_tensor: {face_mask_tensor}")
 
             video = pipe(
                 ref_image_pil,
@@ -254,6 +286,8 @@ def run_inference(args, ctx):
                 context_overlap=args.context_overlap
             ).videos
 
+            _logger.debug(f"video: {video}")
+
             video = video
             save_videos_grid(
                 video,
@@ -267,7 +301,7 @@ def run_inference(args, ctx):
             video_clip = video_clip.set_audio(audio_clip)
             video_clip.write_videofile(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4", codec="libx264", audio_codec="aac")
             output_path = f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4"
-            print('output_path', output_path)
+            _logger.debug(f"output_path: {output_path}")
 
     return output_path
 
