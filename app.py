@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from infer_audio2vid import run_inference, run_inference_init
 from urllib.parse import urlparse
 
 import argparse, os, yaml, tempfile, requests, logging
@@ -9,6 +8,8 @@ _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.DEBUG)
 
 app = FastAPI()
+
+DEF_ACC = True
 
 class InferConfig(BaseModel):
     W: int = 512
@@ -19,8 +20,8 @@ class InferConfig(BaseModel):
     facecrop_dilation_ratio: float = 0.5
     context_frames: int = 12
     context_overlap: int = 3
-    cfg: float = 2.5
-    steps: int = 30
+    cfg: float = 1.0 if DEF_ACC else 2.5
+    steps: int = 6 if DEF_ACC else 30
     sample_rate: int = 16000
     fps: int = 24
     device: str = "cuda"
@@ -38,15 +39,15 @@ def quoted_presenter(dumper, data):
 
 yaml.add_representer(QuotedString, quoted_presenter)
 
-def _create_temp_config_file(ref_image_path, audio_path):
+def _create_temp_config_file(ref_image_path, audio_path, acc=False):
     config_content = {
         "pretrained_base_model_path": "./pretrained_weights/sd-image-variations-diffusers/",
         "pretrained_vae_path": "./pretrained_weights/sd-vae-ft-mse/",
         "audio_model_path": "./pretrained_weights/audio_processor/whisper_tiny.pt",
-        "denoising_unet_path": "./pretrained_weights/denoising_unet.pth",
+        "denoising_unet_path": "./pretrained_weights/denoising_unet_acc.pth" if acc else "./pretrained_weights/denoising_unet.pth",
         "reference_unet_path": "./pretrained_weights/reference_unet.pth",
         "face_locator_path": "./pretrained_weights/face_locator.pth",
-        "motion_module_path": "./pretrained_weights/motion_module.pth",
+        "motion_module_path": "./pretrained_weights/motion_module_acc.pth" if acc else "./pretrained_weights/motion_module.pth",
         "inference_config": "./configs/inference/inference_v2.yaml",
         "weight_dtype": "fp16",
         "test_cases": {
@@ -82,7 +83,7 @@ _ctx = {}
 async def infer(request: InferenceRequest):
     ref_image_path = _download_file(request.ref_image_url)
     audio_path = _download_file(request.audio_url)
-    config_path = _create_temp_config_file(ref_image_path, audio_path)
+    config_path = _create_temp_config_file(ref_image_path, audio_path, acc=DEF_ACC)
     
     _logger.debug(f"ref_image_path: {ref_image_path}")
     _logger.debug(f"audio_path: {audio_path}")
@@ -113,7 +114,12 @@ async def infer(request: InferenceRequest):
     )
     _logger.debug(f"args: {args}")
 
-    output_path = run_inference(args, _ctx)
+    if DEF_ACC:
+        from infer_audio2vid_acc import run_inference as run_inference_acc
+        output_path = run_inference_acc(args, _ctx)
+    else:
+        from infer_audio2vid import run_inference
+        output_path = run_inference(args, _ctx)
     
     return {
         "ref_image_path": ref_image_path, 
@@ -123,6 +129,11 @@ async def infer(request: InferenceRequest):
 
 @app.on_event("startup")
 def _init():
-    _config_path = _create_temp_config_file("", "")
+    _config_path = _create_temp_config_file("", "", acc=DEF_ACC)
     args = argparse.Namespace(config=_config_path, device="cuda")
-    run_inference_init(args, _ctx)
+    if DEF_ACC:
+        from infer_audio2vid_acc import run_inference_init as run_inference_init_acc
+        run_inference_init_acc(args, _ctx)
+    else:
+        from infer_audio2vid import run_inference_init
+        run_inference_init(args, _ctx)

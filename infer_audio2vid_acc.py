@@ -31,6 +31,11 @@ from src.models.face_locator import FaceLocator
 from moviepy.editor import VideoFileClip, AudioFileClip
 from facenet_pytorch import MTCNN
 
+import logging
+
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.DEBUG)
+
 ffmpeg_path = os.getenv('FFMPEG_PATH')
 if ffmpeg_path is None and platform.system() in ['Linux', 'Darwin']:
     try:
@@ -86,24 +91,27 @@ def select_face(det_bboxes, probs):
     sorted_bboxes = sorted(filtered_bboxes, key=lambda x:(x[3]-x[1]) * (x[2] - x[0]), reverse=True)
     return sorted_bboxes[0]
 
-
-
 def main():
     args = parse_args()
+    ctx = {}
+    run_inference_init(args, ctx)
+    run_inference(args, ctx)
 
+def run_inference_init(args, ctx):
     config = OmegaConf.load(args.config)
     if config.weight_dtype == "fp16":
         weight_dtype = torch.float16
     else:
         weight_dtype = torch.float32
+    ctx['weight_dtype'] = weight_dtype
 
     device = args.device
     if device.__contains__("cuda") and not torch.cuda.is_available():
         device = "cpu"
+    ctx['device'] = device
 
     inference_config_path = config.inference_config
     infer_config = OmegaConf.load(inference_config_path)
-
 
     ############# model_init started #############
 
@@ -111,6 +119,7 @@ def main():
     vae = AutoencoderKL.from_pretrained(
         config.pretrained_vae_path,
     ).to("cuda", dtype=weight_dtype)
+    ctx['vae'] = vae
 
     ## reference net init
     reference_unet = UNet2DConditionModel.from_pretrained(
@@ -120,6 +129,7 @@ def main():
     reference_unet.load_state_dict(
         torch.load(config.reference_unet_path, map_location="cpu"),
     )
+    ctx['reference_unet'] = reference_unet
 
     ## denoising net init
     if os.path.exists(config.motion_module_path):
@@ -146,34 +156,43 @@ def main():
         torch.load(config.denoising_unet_path, map_location="cpu"),
         strict=False
     )
+    ctx['denoising_unet'] = denoising_unet
 
     ## face locator init
     face_locator = FaceLocator(320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)).to(
         dtype=weight_dtype, device="cuda"
     )
     face_locator.load_state_dict(torch.load(config.face_locator_path))
+    ctx['face_locator'] = face_locator
 
     ### load audio processor params
     audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
+    ctx['audio_processor'] = audio_processor
 
     ### load face detector params
     face_detector = MTCNN(image_size=320, margin=0, min_face_size=20, thresholds=[0.6, 0.7, 0.7], factor=0.709, post_process=True, device=device)
+    ctx['face_detector'] = face_detector
 
     ############# model_init finished #############
 
-    width, height = args.W, args.H
     sched_kwargs = OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
     scheduler = DDIMScheduler(**sched_kwargs)
+    ctx['scheduler'] = scheduler
+
+def run_inference(args, ctx):
+    config = OmegaConf.load(args.config)
+    width, height = args.W, args.H
 
     pipe = Audio2VideoPipeline(
-        vae=vae,
-        reference_unet=reference_unet,
-        denoising_unet=denoising_unet,
-        audio_guider=audio_processor,
-        face_locator=face_locator,
-        scheduler=scheduler,
+        vae=ctx['vae'],
+        reference_unet=ctx['reference_unet'],
+        denoising_unet=ctx['denoising_unet'],
+        audio_guider=ctx['audio_processor'],
+        face_locator=ctx['face_locator'],
+        scheduler=ctx['scheduler'],
     )
-    pipe = pipe.to("cuda", dtype=weight_dtype)
+    pipe = pipe.to(ctx['device'], dtype=ctx['weight_dtype'])
+    _logger.debug(f"pipe: {pipe}")
 
     date_str = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M")
@@ -189,16 +208,32 @@ def main():
             else:
                 generator = torch.manual_seed(random.randint(100, 1000000))
 
+            _logger.debug(f"ref_image_path: {ref_image_path}")
+            _logger.debug(f"audio_path: {audio_path}")
+
             ref_name = Path(ref_image_path).stem
             audio_name = Path(audio_path).stem
             final_fps = args.fps
+
+            _logger.debug(f"ref_name: {ref_name}")
+            _logger.debug(f"audio_name: {audio_name}")
+            _logger.debug(f"final_fps: {final_fps}")
 
             #### face musk prepare
             face_img = cv2.imread(ref_image_path)
             face_mask = np.zeros((face_img.shape[0], face_img.shape[1])).astype('uint8')
 
+            _logger.debug(f"face_img: {face_img}")
+            _logger.debug(f"face_mask: {face_mask}")
+
+            face_detector = ctx['face_detector']  
             det_bboxes, probs = face_detector.detect(face_img)
             select_bbox = select_face(det_bboxes, probs)
+
+            _logger.debug(f"det_bboxes: {det_bboxes}")
+            _logger.debug(f"probs: {probs}")
+            _logger.debug(f"select_bbox: {select_bbox}")
+
             if select_bbox is None:
                 face_mask[:, :] = 255
             else:
@@ -209,18 +244,31 @@ def main():
                 c_pad = int((ce - cb) * args.facemusk_dilation_ratio)
                 face_mask[rb - r_pad : re + r_pad, cb - c_pad : ce + c_pad] = 255
 
+                _logger.debug(f"rb: {rb}")
+                _logger.debug(f"re: {re}")
+                _logger.debug(f"cb: {cb}")
+                _logger.debug(f"ce: {ce}")
+                _logger.debug(f"r_pad: {r_pad}")
+                _logger.debug(f"c_pad: {c_pad}")
+                _logger.debug(f"face_mask: {face_mask}")
+
                 #### face crop
                 r_pad_crop = int((re - rb) * args.facecrop_dilation_ratio)
                 c_pad_crop = int((ce - cb) * args.facecrop_dilation_ratio)
                 crop_rect = [max(0, cb - c_pad_crop), max(0, rb - r_pad_crop), min(ce + c_pad_crop, face_img.shape[1]), min(re + c_pad_crop, face_img.shape[0])]
-                print(crop_rect)
+                _logger.debug(f"crop_rect: {crop_rect}")
+
                 face_img, _ = crop_and_pad(face_img, crop_rect)
                 face_mask, _ = crop_and_pad(face_mask, crop_rect)
                 face_img = cv2.resize(face_img, (args.W, args.H))
                 face_mask = cv2.resize(face_mask, (args.W, args.H))
 
             ref_image_pil = Image.fromarray(face_img[:, :, [2, 1, 0]])
-            face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device="cuda").unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
+            weight_dtype = ctx['weight_dtype']
+            device = ctx['device']
+            face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
+
+            _logger.debug(f"face_mask_tensor: {face_mask_tensor}")
 
             video = pipe(
                 ref_image_pil,
@@ -238,6 +286,8 @@ def main():
                 context_overlap=args.context_overlap
             ).videos
 
+            _logger.debug(f"video: {video}")
+
             video = video
             save_videos_grid(
                 video,
@@ -250,8 +300,10 @@ def main():
             audio_clip = AudioFileClip(audio_path)
             video_clip = video_clip.set_audio(audio_clip)
             video_clip.write_videofile(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4", codec="libx264", audio_codec="aac")
-            print(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4")
+            output_path = f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4"
+            _logger.debug(f"output_path: {output_path}")
 
+    return output_path
 
 if __name__ == "__main__":
     main()
